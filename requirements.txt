@@ -1,0 +1,5 @@
+playwright
+boto3
+requests
+pyotp
+
