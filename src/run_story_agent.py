@@ -103,6 +103,7 @@ def main():
     parser.add_argument("--headful", action="store_true", help="Run browser headful for debugging")
     parser.add_argument("--verbose", action="store_true", help="Print full prompts, responses, and step logs")
     parser.add_argument("--repair", action="store_true", help="Enable agent-in-the-loop selector repair on failures")
+    parser.add_argument("--agent-verify", action="store_true", help="Ask agent to verify post-assert state to catch false positives")
 
     args = parser.parse_args()
 
@@ -142,6 +143,7 @@ def main():
             model_id=args.model_id,
             region=args.region,
             repair=args.repair,
+            agent_verify=args.agent_verify,
         ))
 
         results_path = run_dir / "results.json"

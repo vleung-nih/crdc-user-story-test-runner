@@ -1,4 +1,4 @@
-As a logged in user, I want to be able to access Manage Studies.
+As a logged in user, I want to be able to click my username and access Manage Studies.
 
 Acceptance criteria:
 - I can click the user account and the Manage Studies menu is present

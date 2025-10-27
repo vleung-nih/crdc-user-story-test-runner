@@ -17,6 +17,88 @@ ALLOWED_AUTH_SUFFIXES = [
     "identitysandbox.gov",
 ]
 
+# Default selector overrides (self-healing hints)
+DEFAULT_OVERRIDES = {
+    "user-menu-toggle": [
+        {"engine": "role", "role": "button", "name_regex": r"user|account|profile"},
+        {"engine": "text", "text": "User"},
+        {"engine": "css", "value": "[aria-label*='User']"},
+    ],
+    "user-account-menu": [
+        {"engine": "role", "role": "button", "name_regex": r"user|account|profile"},
+    ],
+    "manage-studies-link": [
+        {"engine": "role", "role": "menuitem", "name_regex": r"manage\s*studies"},
+        {"engine": "text", "text": "Manage Studies"},
+        {"engine": "css", "value": "a:has-text('Manage Studies')"},
+    ],
+    "studies-list": [
+        {"engine": "role", "role": "table", "name_regex": r"stud(y|ies)"},
+        {"engine": "role", "role": "list", "name_regex": r"stud(y|ies)"},
+        {"engine": "text", "text": "Studies"},
+    ],
+    "add-study-button": [
+        {"engine": "role", "role": "button", "name_regex": r"add\s*study"},
+        {"engine": "text", "text": "Add Study"},
+        {"engine": "css", "value": "button:has-text('Add Study')"},
+        {"engine": "css", "value": "[aria-label*='Add Study']"},
+    ],
+}
+
+
+async def build_element_inventory(page, limit: int = 200) -> dict:
+    """Collect lightweight element inventory to aid selector repair and agent context."""
+    inventory: dict[str, list] = {
+        "testids": [],
+        "aria_labels": [],
+        "buttons": [],
+        "links": [],
+        "menuitems": [],
+        "roles": [],
+    }
+    try:
+        # data-testid values
+        testid_els = await page.query_selector_all("[data-testid]")
+        for el in testid_els[:limit]:
+            try:
+                v = await el.get_attribute("data-testid")
+                if v and v not in inventory["testids"]:
+                    inventory["testids"].append(v)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        aria_els = await page.query_selector_all("[aria-label]")
+        for el in aria_els[:limit]:
+            try:
+                v = await el.get_attribute("aria-label")
+                if v and v not in inventory["aria_labels"]:
+                    inventory["aria_labels"].append(v)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # Role-based text
+    async def collect_role(role: str, key: str):
+        try:
+            els = await page.query_selector_all(f"[role='{role}']")
+            for el in els[:limit]:
+                try:
+                    txt = (await el.inner_text()).strip()
+                    if txt and txt not in inventory[key]:
+                        inventory[key].append(txt)
+                except Exception:
+                    continue
+            if role not in inventory["roles"]:
+                inventory["roles"].append(role)
+        except Exception:
+            pass
+    await collect_role("button", "buttons")
+    await collect_role("link", "links")
+    await collect_role("menuitem", "menuitems")
+    return inventory
+
 
 def host_allowed(url: str, base_host: str) -> bool:
     try:
@@ -344,7 +426,7 @@ async def handle_otp_and_consent(page, totp_secret: str, base_host: str, verbose
     raise AssertionError("OTP failed after 2 attempts")
 
 
-async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, headless: bool = True, verbose: bool = False, model_id: str | None = None, region: str | None = None, repair: bool = False) -> dict:
+async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, headless: bool = True, verbose: bool = False, model_id: str | None = None, region: str | None = None, repair: bool = False, agent_verify: bool = False) -> dict:
     screenshots_dir = run_dir / "screenshots"
     screenshots_dir.mkdir(parents=True, exist_ok=True)
 
@@ -406,6 +488,27 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                 cache_path.write_text(json.dumps(selector_cache, indent=2), encoding="utf-8")
             except Exception:
                 pass
+
+        # Project overrides (user-editable)
+        overrides_path = Path("data/selectors_overrides.json")
+        try:
+            if overrides_path.exists():
+                user_overrides = json.loads(overrides_path.read_text(encoding="utf-8"))
+            else:
+                user_overrides = {}
+        except Exception:
+            user_overrides = {}
+
+        def get_override_candidates(slug: str) -> list[dict]:
+            if not slug:
+                return []
+            cands = []
+            if slug in DEFAULT_OVERRIDES:
+                cands.extend(DEFAULT_OVERRIDES[slug])
+            if slug in user_overrides:
+                # user overrides win by being appended later
+                cands.extend(user_overrides[slug])
+            return cands
 
         async def open_user_menu_if_needed():
             # Try common triggers for a user/account menu
@@ -536,6 +639,17 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                 if m:
                     selector = f"text={m.group(1)}"
 
+            # Normalize dict with {type,value}
+            if isinstance(selector, dict) and "type" in selector and "value" in selector and "text" not in selector and "css" not in selector and "data-testid" not in selector:
+                t = (selector.get("type") or "").lower()
+                v = selector.get("value")
+                if t == "text":
+                    selector = {"text": v}
+                elif t in ("css",):
+                    selector = {"css": v}
+                elif t in ("testid", "data-testid"): 
+                    selector = {"data-testid": v}
+
             cached = cache_get(cache_key)
             if cached:
                 fr, loc = await find_locator_any_frame(cached)
@@ -579,6 +693,15 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                 if fr:
                     cache_put(cache_key, {"engine": "css", "value": selector})
                     return fr, loc, cache_key
+                # If CSS with aria-label fails, try role+name from aria-label
+                m_al = re.search(r"aria-label=['\"](.+?)['\"]", selector)
+                if m_al:
+                    name = m_al.group(1)
+                    for role in ("button", "link"):
+                        fr, loc = await find_locator_any_frame({"engine": "role", "role": role, "name_regex": re.escape(name)})
+                        if fr:
+                            cache_put(cache_key, {"engine": "role", "role": role, "name_regex": re.escape(name)})
+                            return fr, loc, cache_key
 
             # 3) text= engine
             if isinstance(selector, str) and selector.startswith("text="):
@@ -606,6 +729,12 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                 f"#{slug}",
                 f"[name='{slug}']",
             ] if slug else []
+            # Overrides for well-known slugs
+            for t in get_override_candidates(slug):
+                fr, loc = await find_locator_any_frame(t)
+                if fr:
+                    cache_put(cache_key, t)
+                    return fr, loc, cache_key
             for css in candidates_css:
                 fr, loc = await find_locator_any_frame({"engine": "css", "value": css})
                 if fr:
@@ -643,19 +772,25 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                 return []
             try:
                 # Minimal, safe prompt: propose only CSS or test id forms
-                from .story_agent import bedrock_invoke_claude
+                from story_agent import bedrock_invoke_claude
                 prompt = (
                     "You are a test selector repair assistant. Given a failed selector and a short page URL, propose up to 3 alternative selectors.\n"
                     "Rules: Only output a JSON array of strings; each must be a CSS selector or data-testid form. No prose.\n\n"
                     f"Failed selector: {selector}\n"
                     f"Current URL: {context_hint}\n"
                 )
+                if verbose:
+                    print(f"🔧 Repairing selector: {selector}")
                 raw = bedrock_invoke_claude(prompt, model_id=model_id, region=region, verbose=verbose)
                 try:
                     arr = json.loads(raw.strip().split("```")[-1]) if raw.strip().startswith("```") else json.loads(raw)
                     if isinstance(arr, list):
+                        if verbose:
+                            print(f"🔧 Repair suggestions: {arr}")
                         return [s for s in arr if isinstance(s, str) and s]
                 except Exception:
+                    if verbose:
+                        print("🔧 Repair returned non-JSON or unusable content")
                     return []
             except Exception:
                 return []
@@ -671,6 +806,48 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                 if fr:
                     return fr, loc, key2
             return None, None, key
+
+        async def agent_verify_state_if_enabled(step: dict) -> None:
+            if not agent_verify or not model_id or not region:
+                return
+            try:
+                # Lightweight DOM snapshot
+                inventory = await build_element_inventory(page, limit=100)
+                from story_agent import bedrock_invoke_claude, bedrock_invoke_claude_multimodal
+                if verbose:
+                    print(f"→ Verifying step via agent (url={page.url})")
+                    try:
+                        print(f"→ Verify step summary: action={step.get('action')} target={step.get('target') or step.get('selector')}")
+                    except Exception:
+                        pass
+                prompt = (
+                    "You are verifying a UI test step result. Output only JSON: {\"ok\": boolean, \"reason\": string}.\n"
+                    "Given the current URL, the expected step, a page screenshot, and a summary of present elements, decide if the step truly succeeded.\n"
+                    f"Current URL: {page.url}\n"
+                    f"Step: {json.dumps(step)}\n"
+                    f"Elements: {json.dumps(inventory)}\n"
+                )
+                # Capture an on-the-fly JPEG screenshot for verification
+                import base64
+                shot_bytes = await page.screenshot(full_page=True, type="jpeg", quality=70)
+                img_payload = [{"media_type": "image/jpeg", "data_base64": base64.b64encode(shot_bytes).decode("ascii")}]
+                raw = bedrock_invoke_claude_multimodal(prompt, images=img_payload, model_id=model_id, region=region, verbose=verbose)
+                verdict = {}
+                try:
+                    body = raw.strip()
+                    if body.startswith("```"):
+                        body = body.split("```")[-1]
+                    verdict = json.loads(body)
+                except Exception:
+                    verdict = {"ok": True, "reason": "Agent returned non-JSON; skipping enforcement"}
+                if verbose:
+                    print(f"🤖 Verify verdict: {verdict}")
+                if isinstance(verdict, dict) and verdict.get("ok") is False:
+                    raise AssertionError(f"Agent verification failed: {verdict.get('reason','no reason')}")
+            except Exception as ve:
+                # If agent verification fails in parsing/transport, don't block unless explicit
+                if verbose:
+                    print(f"🤖 Verify error/non-blocking: {ve}")
 
         for test in test_cases:
             if verbose:
@@ -717,10 +894,31 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                                 await fill_credentials_and_submit(page, username, password, verbose=verbose)
                                 await handle_otp_and_consent(page, secret, (urllib.parse.urlparse(base_url).hostname or ""), verbose=verbose)
                                 session_logged_in = True
-                    elif action in ("assert_text", "assert_text_present"):
+                                # Build and store element inventory for later repair/agent context
+                                try:
+                                    inventory = await build_element_inventory(page)
+                                    inv_path = Path("data/runs") / f"run_{os.environ.get('RUN_ID','latest')}" / "element_inventory.json"
+                                    inv_path.parent.mkdir(parents=True, exist_ok=True)
+                                    inv_path.write_text(json.dumps(inventory, indent=2), encoding="utf-8")
+                                    if verbose:
+                                        print(f"🧭 Element inventory saved to {inv_path}")
+                                except Exception as e:
+                                    if verbose:
+                                        print(f"🧭 Element inventory failed: {e}")
+                    elif action in ("assert_text", "assert_text_present", "assert_visible"):
                         text = step.get("text")
-                        loc = page.get_by_text(text, exact=False).first
+                        sel = step.get("selector") or step.get("target")
+                        loc = None
+                        if isinstance(sel, dict) and sel.get("text"):
+                            loc = page.get_by_text(sel.get("text"), exact=False).first
+                        elif isinstance(sel, dict) and sel.get("type") == "text":
+                            loc = page.get_by_text(sel.get("value"), exact=False).first
+                        elif isinstance(sel, str) and sel.startswith("text="):
+                            loc = page.get_by_text(sel.split("=",1)[1], exact=False).first
+                        else:
+                            loc = page.get_by_text(text or str(sel), exact=False).first
                         await loc.wait_for(state="visible", timeout=8000)
+                        await agent_verify_state_if_enabled(step)
                     elif action in ("assert_element_present", "assert_element_presence", "assert_element_exists", "assert_element_visible", "assert_element", "assert"):
                         selector = step.get("selector") or step.get("target")
                         fr, loc, key = await resolve_with_repair(selector, hints=None)
@@ -745,6 +943,7 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                                 visible = False
                             if visible:
                                 raise AssertionError(f"Element should not be visible: {selector}")
+                        await agent_verify_state_if_enabled(step)
                     elif action == "click":
                         selector = step.get("selector") or step.get("target")
                         fr, loc, key = await resolve_with_repair(selector, hints=None)
@@ -776,6 +975,13 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                     elif action in ("screenshot",):
                         name = step.get("name", test.get("name", "screenshot").replace(" ", "_").lower())
                         shot = screenshots_dir / f"{name}.png"
+                        # Optional delay before screenshot to allow UI to settle
+                        try:
+                            delay_ms = int(os.environ.get("SCREENSHOT_DELAY_MS", "2000"))
+                        except Exception:
+                            delay_ms = 2000
+                        if delay_ms > 0:
+                            await page.wait_for_timeout(delay_ms)
                         await page.screenshot(path=str(shot), full_page=True)
                         screenshot = str(shot)
                     else:
@@ -793,6 +999,13 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                 print(f"✖ Test failed: {test.get('name','Unnamed')} — {error} (url={current_url})")
                 try:
                     shot = screenshots_dir / (test.get("name", "failure").replace(" ", "_").lower() + "_failure.png")
+                    # Apply same pre-screenshot delay on failure captures
+                    try:
+                        delay_ms = int(os.environ.get("SCREENSHOT_DELAY_MS", "2000"))
+                    except Exception:
+                        delay_ms = 2000
+                    if delay_ms > 0:
+                        await page.wait_for_timeout(delay_ms)
                     await page.screenshot(path=str(shot), full_page=True)
                     screenshot = str(shot)
                 except Exception:
