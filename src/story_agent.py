@@ -26,6 +26,7 @@ def build_prompt(story_text: str, base_url: str, inventory: dict | None = None) 
         "- Avoid placeholders; use fill_env for credentials and login_via_login_gov for reliability.\n"
         "- Do NOT invent testids. If a data-testid from Known elements exists, use it; otherwise use role+name or text.\n"
         "- Avoid CSS [text='...']; use structured targets like {type:'text',value:'...'} or data-testid form.\n"
+        "- For presence-only checks use 'assert' with exists:true (or existence:true); visibility is not required.\n"
         "- Limit to 3–8 tests.\n"
     )
 

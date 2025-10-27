@@ -807,9 +807,9 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                     return fr, loc, key2
             return None, None, key
 
-        async def agent_verify_state_if_enabled(step: dict) -> None:
+        async def agent_verify_state_if_enabled(step: dict, test_name: str, step_index: int) -> str:
             if not agent_verify or not model_id or not region:
-                return
+                return ""
             try:
                 # Lightweight DOM snapshot
                 inventory = await build_element_inventory(page, limit=100)
@@ -835,8 +835,15 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                 verdict = {}
                 try:
                     body = raw.strip()
+                    # Strip code fences if present
                     if body.startswith("```"):
-                        body = body.split("```")[-1]
+                        body = body.replace("```json", "").replace("```", "").strip()
+                    # Fallback: extract between first { and last }
+                    if not body.strip().startswith("{"):
+                        start = body.find("{")
+                        end = body.rfind("}")
+                        if start != -1 and end != -1 and end > start:
+                            body = body[start:end+1]
                     verdict = json.loads(body)
                 except Exception:
                     verdict = {"ok": True, "reason": "Agent returned non-JSON; skipping enforcement"}
@@ -844,10 +851,20 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                     print(f"🤖 Verify verdict: {verdict}")
                 if isinstance(verdict, dict) and verdict.get("ok") is False:
                     raise AssertionError(f"Agent verification failed: {verdict.get('reason','no reason')}")
+                # Save verification screenshot to disk
+                try:
+                    # Normalize test name
+                    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", test_name).strip("_").lower() or "test"
+                    verify_path = screenshots_dir / f"verify_{slug}_step{step_index}.jpg"
+                    verify_path.write_bytes(shot_bytes)
+                    return str(verify_path)
+                except Exception:
+                    return ""
             except Exception as ve:
                 # If agent verification fails in parsing/transport, don't block unless explicit
                 if verbose:
                     print(f"🤖 Verify error/non-blocking: {ve}")
+            return ""
 
         for test in test_cases:
             if verbose:
@@ -856,7 +873,7 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
             error = ""
             screenshot = ""
             try:
-                for step in test.get("steps", []):
+                for idx, step in enumerate(test.get("steps", []), start=1):
                     if verbose:
                         print(f"→ Step: {step}")
                     action = step.get("action")
@@ -918,7 +935,7 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                         else:
                             loc = page.get_by_text(text or str(sel), exact=False).first
                         await loc.wait_for(state="visible", timeout=8000)
-                        await agent_verify_state_if_enabled(step)
+                        _ver_path = await agent_verify_state_if_enabled(step, test.get('name','Unnamed'), idx)
                     elif action in ("assert_element_present", "assert_element_presence", "assert_element_exists", "assert_element_visible", "assert_element", "assert"):
                         selector = step.get("selector") or step.get("target")
                         fr, loc, key = await resolve_with_repair(selector, hints=None)
@@ -928,14 +945,10 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                             fr, loc, key = await resolve_with_repair(selector, hints=None)
                         if not fr:
                             raise AssertionError(f"Could not resolve selector: {selector}")
-                        try:
-                            await loc.wait_for(state="visible", timeout=8000)
-                        except Exception:
-                            # Trigger repair on visibility timeout as well
-                            fr, loc, key = await resolve_with_repair(selector, hints=None)
-                            await loc.wait_for(state="visible", timeout=5000)
-                        # Optional exists=false handling
-                        if action == "assert" and step.get("exists") is False:
+                        # Presence vs visibility semantics
+                        expect_exists = step.get("exists") if "exists" in step else step.get("existence") if "existence" in step else None
+                        if expect_exists is False:
+                            # Ensure not visible/present
                             visible = False
                             try:
                                 visible = await loc.is_visible()
@@ -943,7 +956,20 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                                 visible = False
                             if visible:
                                 raise AssertionError(f"Element should not be visible: {selector}")
-                        await agent_verify_state_if_enabled(step)
+                        elif expect_exists is True or action in ("assert_element_present", "assert_element_presence", "assert_element_exists", "assert_element"):
+                            # Only require presence (not visibility)
+                            cnt = await loc.count()
+                            if not cnt or cnt <= 0:
+                                raise AssertionError(f"Element not found: {selector}")
+                        else:
+                            # Default behavior: require visibility
+                            try:
+                                await loc.wait_for(state="visible", timeout=8000)
+                            except Exception:
+                                # Trigger repair on visibility timeout as well
+                                fr, loc, key = await resolve_with_repair(selector, hints=None)
+                                await loc.wait_for(state="visible", timeout=5000)
+                        _ver_path = await agent_verify_state_if_enabled(step, test.get('name','Unnamed'), idx)
                     elif action == "click":
                         selector = step.get("selector") or step.get("target")
                         fr, loc, key = await resolve_with_repair(selector, hints=None)
