@@ -102,6 +102,7 @@ def main():
     parser.add_argument("--region", default="us-east-1")
     parser.add_argument("--headful", action="store_true", help="Run browser headful for debugging")
     parser.add_argument("--verbose", action="store_true", help="Print full prompts, responses, and step logs")
+    parser.add_argument("--repair", action="store_true", help="Enable agent-in-the-loop selector repair on failures")
 
     args = parser.parse_args()
 
@@ -138,6 +139,9 @@ def main():
             run_dir=run_dir,
             headless=(not args.headful),
             verbose=args.verbose,
+            model_id=args.model_id,
+            region=args.region,
+            repair=args.repair,
         ))
 
         results_path = run_dir / "results.json"

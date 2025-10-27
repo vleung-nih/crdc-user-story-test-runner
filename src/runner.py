@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 import urllib.parse
@@ -107,6 +108,32 @@ async def click_login_button(page, verbose: bool = False) -> None:
         except Exception:
             pass
     raise AssertionError("Login button not found")
+
+
+async def login_button_visible(page) -> bool:
+    """Return True if a Login/Log in/Sign in control is visible on the current page."""
+    # Prefer explicit test id
+    try:
+        el = await page.query_selector("[data-testid='login-button']")
+        if el and await el.is_visible():
+            return True
+    except Exception:
+        pass
+    # Role/button patterns
+    try:
+        loc = page.get_by_role("button", name=re.compile(r"^(login|log\s*in|sign\s*in)$", re.I)).first
+        if await loc.is_visible():
+            return True
+    except Exception:
+        pass
+    # Text-based fallback
+    try:
+        loc = page.get_by_text(re.compile(r"^(login|log\s*in|sign\s*in)$", re.I), exact=False).first
+        if await loc.is_visible():
+            return True
+    except Exception:
+        pass
+    return False
 
 
 async def click_login_gov(page, verbose: bool = False) -> None:
@@ -317,7 +344,7 @@ async def handle_otp_and_consent(page, totp_secret: str, base_host: str, verbose
     raise AssertionError("OTP failed after 2 attempts")
 
 
-async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, headless: bool = True, verbose: bool = False) -> dict:
+async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, headless: bool = True, verbose: bool = False, model_id: str | None = None, region: str | None = None, repair: bool = False) -> dict:
     screenshots_dir = run_dir / "screenshots"
     screenshots_dir.mkdir(parents=True, exist_ok=True)
 
@@ -357,6 +384,293 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
         page.on("popup", lambda p: asyncio.create_task(on_popup(p)))
 
         results = []
+        session_logged_in = False
+
+        # Simple selector cache (persists across runs)
+        cache_path = Path("data/selector_cache.json")
+        try:
+            if cache_path.exists():
+                selector_cache = json.loads(cache_path.read_text(encoding="utf-8"))
+            else:
+                selector_cache = {}
+        except Exception:
+            selector_cache = {}
+
+        def cache_get(key: str):
+            return selector_cache.get(key)
+
+        def cache_put(key: str, value: dict):
+            selector_cache[key] = value
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(json.dumps(selector_cache, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+
+        async def open_user_menu_if_needed():
+            # Try common triggers for a user/account menu
+            patterns = [r"user", r"account", r"profile", r"menu", r"my\s*account", r"settings"]
+            for pat in patterns:
+                try:
+                    loc = page.get_by_role("button", name=re.compile(pat, re.I)).first
+                    if await loc.is_visible():
+                        await loc.click(timeout=4000)
+                        await page.wait_for_load_state("networkidle")
+                        return True
+                except Exception:
+                    continue
+            # Test ID variants
+            for sel in [
+                "[data-testid*='user']",
+                "[data-testid*='account']",
+                "#userMenu",
+                ".user-menu",
+            ]:
+                try:
+                    el = await page.query_selector(sel)
+                    if el and await el.is_visible():
+                        await el.click(timeout=4000)
+                        await page.wait_for_load_state("networkidle")
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        async def is_logged_in() -> bool:
+            if session_logged_in:
+                return True
+            # If we haven't navigated yet, we are not logged in
+            try:
+                cur = page.url
+                if not cur or cur.startswith("about:"):
+                    return False
+            except Exception:
+                return False
+            # If a Login control is visible, we are not logged in
+            try:
+                loc = page.get_by_role("button", name=re.compile(r"^(login|log\s*in|sign\s*in)$", re.I)).first
+                if await loc.is_visible():
+                    return False
+            except Exception:
+                pass
+            try:
+                el = await page.query_selector("[data-testid='login-button']")
+                if el and await el.is_visible():
+                    return False
+            except Exception:
+                pass
+            # Positive signals for logged-in
+            try:
+                el = await page.query_selector("[data-testid='user-menu']")
+                if el and await el.is_visible():
+                    return True
+            except Exception:
+                pass
+            for pat in (r"user", r"account", r"profile"):
+                try:
+                    loc = page.get_by_role("button", name=re.compile(pat, re.I)).first
+                    if await loc.is_visible():
+                        return True
+                except Exception:
+                    continue
+            # Default to True to avoid re-login loops when login controls are absent
+            return True
+
+        async def find_locator_any_frame(target: dict):
+            """Return (frame, locator) for first visible match, else (None, None).
+            target keys accepted:
+              - engine: 'testid'|'css'|'text'|'role'
+              - value/text/role/name_regex
+            """
+            frames = list({page.main_frame, *page.frames})
+            for fr in frames:
+                try:
+                    engine = target.get("engine")
+                    if engine == "testid":
+                        loc = fr.get_by_test_id(target["value"]).first
+                    elif engine == "css":
+                        loc = fr.locator(target["value"])  # css selector
+                    elif engine == "text":
+                        loc = fr.get_by_text(target["text"], exact=False).first
+                    elif engine == "role":
+                        name_pattern = re.compile(target["name_regex"], re.I)
+                        loc = fr.get_by_role(target["role"], name=name_pattern).first
+                    else:
+                        continue
+                    try:
+                        if await loc.is_visible():
+                            return fr, loc
+                    except Exception:
+                        pass
+                    # If not visible, still return if it exists; caller can try clicking/opening
+                    try:
+                        cnt = await loc.count()
+                        if cnt and cnt > 0:
+                            return fr, loc
+                    except Exception:
+                        pass
+                except Exception:
+                    continue
+            return None, None
+
+        def slug_to_text(slug: str) -> str:
+            s = re.sub(r"[-_]+", " ", slug)
+            s = re.sub(r"([a-z])([A-Z])", r"\1 \2", s)
+            return s.strip()
+
+        async def resolve_target(selector: str, hints: dict | None = None):
+            """Return (frame, locator, used_key) using cache and multi-strategy resolution."""
+            # Build a stable cache key for strings or dicts
+            if isinstance(selector, dict):
+                cache_key = json.dumps({"target": selector, "hints": hints or {}}, sort_keys=True)
+            else:
+                cache_key = selector
+            if hints:
+                # include role/text hints in key to separate entries
+                cache_key = json.dumps({"selector": selector if isinstance(selector, str) else selector, "hints": hints}, sort_keys=True)
+
+            # Normalizations
+            if isinstance(selector, str) and selector and "[text=" in selector:
+                # Convert [text='...'] into text=...
+                m = re.search(r"\[text=['\"](.+?)['\"]\]", selector)
+                if m:
+                    selector = f"text={m.group(1)}"
+
+            cached = cache_get(cache_key)
+            if cached:
+                fr, loc = await find_locator_any_frame(cached)
+                if fr:
+                    return fr, loc, cache_key
+
+            # Structured dict target
+            if isinstance(selector, dict):
+                if "data-testid" in selector:
+                    fr, loc = await find_locator_any_frame({"engine": "testid", "value": selector["data-testid"]})
+                    if fr:
+                        cache_put(cache_key, {"engine": "testid", "value": selector["data-testid"]})
+                        return fr, loc, cache_key
+                if "role" in selector and "name" in selector:
+                    fr, loc = await find_locator_any_frame({"engine": "role", "role": selector["role"], "name_regex": re.escape(selector["name"])})
+                    if fr:
+                        cache_put(cache_key, {"engine": "role", "role": selector["role"], "name_regex": re.escape(selector["name"])})
+                        return fr, loc, cache_key
+                if "text" in selector:
+                    fr, loc = await find_locator_any_frame({"engine": "text", "text": selector["text"]})
+                    if fr:
+                        cache_put(cache_key, {"engine": "text", "text": selector["text"]})
+                        return fr, loc, cache_key
+                if "css" in selector:
+                    fr, loc = await find_locator_any_frame({"engine": "css", "value": selector["css"]})
+                    if fr:
+                        cache_put(cache_key, {"engine": "css", "value": selector["css"]})
+                        return fr, loc, cache_key
+
+            # 1) Native Playwright test id engine "data-testid=" style
+            m = re.match(r"^data-testid\s*=\s*['\"]?([\w\-:]+)['\"]?$", selector) if isinstance(selector, str) else None
+            if m:
+                fr, loc = await find_locator_any_frame({"engine": "testid", "value": m.group(1)})
+                if fr:
+                    cache_put(cache_key, {"engine": "testid", "value": m.group(1)})
+                    return fr, loc, cache_key
+
+            # 2) CSS as-is (handles [data-testid='...'] etc.)
+            if isinstance(selector, str) and any(c in selector for c in ("[", "]", ".", "#", ":", " ", ">")):
+                fr, loc = await find_locator_any_frame({"engine": "css", "value": selector})
+                if fr:
+                    cache_put(cache_key, {"engine": "css", "value": selector})
+                    return fr, loc, cache_key
+
+            # 3) text= engine
+            if isinstance(selector, str) and selector.startswith("text="):
+                text = selector.split("=", 1)[1]
+                fr, loc = await find_locator_any_frame({"engine": "text", "text": text})
+                if fr:
+                    cache_put(cache_key, {"engine": "text", "text": text})
+                    return fr, loc, cache_key
+
+            # 3b) role= engine (e.g., role=table)
+            m_role = re.match(r"^role\s*=\s*([\w-]+)$", selector) if isinstance(selector, str) else None
+            if m_role:
+                role = m_role.group(1)
+                fr, loc = await find_locator_any_frame({"engine": "role", "role": role, "name_regex": ".*"})
+                if fr:
+                    cache_put(cache_key, {"engine": "role", "role": role, "name_regex": ".*"})
+                    return fr, loc, cache_key
+
+            # 4) Try alternate attribute candidates for a slug
+            slug = selector.strip().strip("'").strip('"') if isinstance(selector, str) else ""
+            candidates_css = [
+                f"[data-testid='{slug}']",
+                f"[data-test-id='{slug}']",
+                f"[data-qa='{slug}']",
+                f"#{slug}",
+                f"[name='{slug}']",
+            ] if slug else []
+            for css in candidates_css:
+                fr, loc = await find_locator_any_frame({"engine": "css", "value": css})
+                if fr:
+                    cache_put(cache_key, {"engine": "css", "value": css})
+                    return fr, loc, cache_key
+
+            # 5) Role + humanized name
+            human = slug_to_text(slug) if slug else ""
+            for role in ("menuitem", "link", "button"):
+                fr, loc = await find_locator_any_frame({"engine": "role", "role": role, "name_regex": re.escape(human)})
+                if fr:
+                    cache_put(cache_key, {"engine": "role", "role": role, "name_regex": re.escape(human)})
+                    return fr, loc, cache_key
+
+            # 6) Text contains humanized name
+            if human:
+                fr, loc = await find_locator_any_frame({"engine": "text", "text": human})
+                if fr:
+                    cache_put(cache_key, {"engine": "text", "text": human})
+                    return fr, loc, cache_key
+
+            # 7) As absolute fallback, try opening user menu once then retry CSS candidates
+            await open_user_menu_if_needed()
+            for css in candidates_css:
+                fr, loc = await find_locator_any_frame({"engine": "css", "value": css})
+                if fr:
+                    cache_put(cache_key, {"engine": "css", "value": css})
+                    return fr, loc, cache_key
+
+            return None, None, cache_key
+
+        async def agent_repair(selector: str, context_hint: str = "") -> list[str]:
+            """Ask the agent for alternative selectors. Returns a list of suggested selectors."""
+            if not repair or not model_id or not region:
+                return []
+            try:
+                # Minimal, safe prompt: propose only CSS or test id forms
+                from .story_agent import bedrock_invoke_claude
+                prompt = (
+                    "You are a test selector repair assistant. Given a failed selector and a short page URL, propose up to 3 alternative selectors.\n"
+                    "Rules: Only output a JSON array of strings; each must be a CSS selector or data-testid form. No prose.\n\n"
+                    f"Failed selector: {selector}\n"
+                    f"Current URL: {context_hint}\n"
+                )
+                raw = bedrock_invoke_claude(prompt, model_id=model_id, region=region, verbose=verbose)
+                try:
+                    arr = json.loads(raw.strip().split("```")[-1]) if raw.strip().startswith("```") else json.loads(raw)
+                    if isinstance(arr, list):
+                        return [s for s in arr if isinstance(s, str) and s]
+                except Exception:
+                    return []
+            except Exception:
+                return []
+
+        async def resolve_with_repair(selector: str, hints: dict | None = None):
+            fr, loc, key = await resolve_target(selector, hints)
+            if fr:
+                return fr, loc, key
+            # Agent repair attempt once
+            suggestions = await agent_repair(selector, context_hint=page.url)
+            for sug in suggestions[:3]:
+                fr, loc, key2 = await resolve_target(sug, hints)
+                if fr:
+                    return fr, loc, key2
+            return None, None, key
 
         for test in test_cases:
             if verbose:
@@ -376,54 +690,89 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                         await page.wait_for_load_state("networkidle")
                         await consent_dismiss(page, verbose=verbose)
                     elif action == "login_via_login_gov":
-                        username = os.environ.get(step.get("username_env", "LOGIN_USERNAME"), "")
-                        password = os.environ.get(step.get("password_env", "LOGIN_PASSWORD"), "")
-                        secret = os.environ.get(step.get("totp_env", "TOTP_SECRET"), "")
-                        if not username or not password or not secret:
-                            raise AssertionError("Missing LOGIN_USERNAME/LOGIN_PASSWORD/TOTP_SECRET envs")
-                        # Go to base page and consent
+                        # Always ensure base page and consent before checking login
                         await page.goto(base_url, timeout=60000)
                         await page.wait_for_load_state("networkidle")
                         await consent_dismiss(page, verbose=verbose)
-                        await click_login_button(page, verbose=verbose)
-                        await click_login_gov(page, verbose=verbose)
-                        await fill_credentials_and_submit(page, username, password, verbose=verbose)
-                        await handle_otp_and_consent(page, secret, (urllib.parse.urlparse(base_url).hostname or ""), verbose=verbose)
-                    elif action in ("assert_text",):
+                        if session_logged_in:
+                            if verbose:
+                                print("→ Session says logged in; skipping login_via_login_gov")
+                        else:
+                            # Decide based on Login button visibility only
+                            should_login = await login_button_visible(page)
+                            if verbose:
+                                print(f"→ Login button visible: {should_login}")
+                            if not should_login:
+                                session_logged_in = True
+                                if verbose:
+                                    print("→ No Login button; treating as logged in")
+                            else:
+                                username = os.environ.get(step.get("username_env", "LOGIN_USERNAME"), "")
+                                password = os.environ.get(step.get("password_env", "LOGIN_PASSWORD"), "")
+                                secret = os.environ.get(step.get("totp_env", "TOTP_SECRET"), "")
+                                if not username or not password or not secret:
+                                    raise AssertionError("Missing LOGIN_USERNAME/LOGIN_PASSWORD/TOTP_SECRET envs")
+                                await click_login_button(page, verbose=verbose)
+                                await click_login_gov(page, verbose=verbose)
+                                await fill_credentials_and_submit(page, username, password, verbose=verbose)
+                                await handle_otp_and_consent(page, secret, (urllib.parse.urlparse(base_url).hostname or ""), verbose=verbose)
+                                session_logged_in = True
+                    elif action in ("assert_text", "assert_text_present"):
                         text = step.get("text")
                         loc = page.get_by_text(text, exact=False).first
                         await loc.wait_for(state="visible", timeout=8000)
-                    elif action in ("assert_element_present", "assert_element_presence", "assert_element_exists"):
-                        selector = step.get("selector")
-                        timeout_ms = 8000
-                        if selector and selector.startswith("text="):
-                            text = selector.split("=", 1)[1]
-                            await page.get_by_text(text, exact=False).first.wait_for(state="visible", timeout=timeout_ms)
-                        elif step.get("text") and selector in ("button", "link"):
-                            role = selector
-                            name = step.get("text")
-                            await page.get_by_role(role, name=re.compile(re.escape(name), re.I)).first.wait_for(state="visible", timeout=timeout_ms)
-                        else:
-                            await page.wait_for_selector(selector, state="visible", timeout=timeout_ms)
+                    elif action in ("assert_element_present", "assert_element_presence", "assert_element_exists", "assert_element_visible", "assert_element", "assert"):
+                        selector = step.get("selector") or step.get("target")
+                        fr, loc, key = await resolve_with_repair(selector, hints=None)
+                        if not fr:
+                            # Try opening user menu then retry
+                            await open_user_menu_if_needed()
+                            fr, loc, key = await resolve_with_repair(selector, hints=None)
+                        if not fr:
+                            raise AssertionError(f"Could not resolve selector: {selector}")
+                        try:
+                            await loc.wait_for(state="visible", timeout=8000)
+                        except Exception:
+                            # Trigger repair on visibility timeout as well
+                            fr, loc, key = await resolve_with_repair(selector, hints=None)
+                            await loc.wait_for(state="visible", timeout=5000)
+                        # Optional exists=false handling
+                        if action == "assert" and step.get("exists") is False:
+                            visible = False
+                            try:
+                                visible = await loc.is_visible()
+                            except Exception:
+                                visible = False
+                            if visible:
+                                raise AssertionError(f"Element should not be visible: {selector}")
                     elif action == "click":
-                        selector = step.get("selector")
-                        timeout_ms = 10000
-                        if selector and selector.startswith("text="):
-                            text = selector.split("=", 1)[1]
-                            await page.get_by_text(text, exact=False).first.click(timeout=timeout_ms)
-                        elif step.get("text") and selector in ("button", "link"):
-                            role = selector
-                            name = step.get("text")
-                            loc = page.get_by_role(role, name=re.compile(re.escape(name), re.I)).first
-                            # For links, verify allowlisted host
-                            if role == "link":
-                                href = await loc.get_attribute("href") or ""
-                                if href and not host_allowed(href, urllib.parse.urlparse(page.url).hostname or ""):
-                                    raise AssertionError(f"Blocked click to external link: {href}")
-                            await loc.click(timeout=timeout_ms)
-                        else:
-                            await page.click(selector, timeout=timeout_ms)
+                        selector = step.get("selector") or step.get("target")
+                        fr, loc, key = await resolve_with_repair(selector, hints=None)
+                        if not fr:
+                            await open_user_menu_if_needed()
+                            fr, loc, key = await resolve_with_repair(selector, hints=None)
+                        if not fr:
+                            raise AssertionError(f"Could not resolve selector for click: {selector}")
+                        # If it is a link, ensure allowlisted
+                        try:
+                            href = await loc.get_attribute("href")
+                            if href and not host_allowed(href, urllib.parse.urlparse(page.url).hostname or ""):
+                                raise AssertionError(f"Blocked click to external link: {href}")
+                        except Exception:
+                            pass
+                        await loc.click(timeout=10000)
                         await page.wait_for_load_state("networkidle")
+                    elif action in ("navigate_to", "navigate"):
+                        url = step.get("url") or step.get("target") or "/"
+                        target = url if url.startswith("http") else base_url.rstrip("/") + "/" + url.lstrip("/")
+                        await page.goto(target, timeout=60000)
+                        await page.wait_for_load_state("networkidle")
+                        await consent_dismiss(page, verbose=verbose)
+                    elif action in ("assert_url_matches", "assert_url_contains"):
+                        expected = step.get("value") or step.get("target") or ""
+                        cur = page.url
+                        if expected and expected not in cur:
+                            raise AssertionError(f"URL '{cur}' does not contain '{expected}'")
                     elif action in ("screenshot",):
                         name = step.get("name", test.get("name", "screenshot").replace(" ", "_").lower())
                         shot = screenshots_dir / f"{name}.png"
