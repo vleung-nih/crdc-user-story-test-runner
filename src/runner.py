@@ -318,33 +318,72 @@ async def handle_otp_and_consent(page, totp_secret: str, base_host: str, verbose
             print(f"→ OTP attempt {attempt+1}, code={code}")
 
         # Fill OTP by label or common selectors
+        filled = False
         try:
+            if verbose:
+                print(f"→ Attempting to fill OTP by label")
             await page.get_by_label(re.compile(r"(one[- ]?time|verification|auth|otp).*code", re.I)).first.fill(code, timeout=8000)
-        except Exception:
-            filled = False
+            filled = True
+            if verbose:
+                print(f"✓ OTP filled via label")
+        except Exception as e:
+            if verbose:
+                print(f"→ OTP fill by label failed: {e}, trying fallback selectors")
             for sel in ["#otp", "input[name*='otp']", "input[id*='otp']", "input[name*='code']", "input[id*='code']"]:
                 try:
+                    if verbose:
+                        print(f"→ Trying OTP selector: {sel}")
                     await page.fill(sel, code, timeout=5000)
                     filled = True
+                    if verbose:
+                        print(f"✓ OTP filled via {sel}")
                     break
-                except Exception:
+                except Exception as e2:
+                    if verbose:
+                        print(f"→ Selector {sel} failed: {e2}")
                     continue
             if not filled:
                 if attempt == 1:
+                    if verbose:
+                        print(f"✖ Unable to fill OTP code after all attempts")
                     raise AssertionError("Unable to fill OTP code")
+                if verbose:
+                    print(f"→ OTP fill failed, waiting 30s and retrying...")
                 await page.wait_for_timeout(30000)
                 continue
 
         # Submit OTP
+        otp_submitted = False
         try:
+            if verbose:
+                print(f"→ Submitting OTP form")
             await page.get_by_role("button", name=re.compile(r"^(submit|continue|verify|sign\s*in)$", re.I)).first.click(timeout=6000)
-        except Exception:
+            otp_submitted = True
+            if verbose:
+                print(f"✓ OTP submitted via role button")
+        except Exception as e:
+            if verbose:
+                print(f"→ OTP submit by role failed: {e}, trying fallback selectors")
             for sel in ["button[type='submit']", "#submit"]:
                 try:
+                    if verbose:
+                        print(f"→ Trying OTP submit selector: {sel}")
                     await page.click(sel, timeout=6000)
+                    otp_submitted = True
+                    if verbose:
+                        print(f"✓ OTP submitted via {sel}")
                     break
-                except Exception:
+                except Exception as e2:
+                    if verbose:
+                        print(f"→ Selector {sel} failed: {e2}")
                     continue
+        if otp_submitted:
+            if verbose:
+                print(f"→ Waiting for page state after OTP submission...")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                await page.wait_for_timeout(2000)  # Fallback wait
 
         # Consent grant if shown (search across frames, multiple labels)
         grant_labels = re.compile(r"\b(grant|authorize|allow|approve|consent|agree)\b", re.I)
@@ -363,24 +402,39 @@ async def handle_otp_and_consent(page, totp_secret: str, base_host: str, verbose
             # Try role=button/link by accessible name
             for fr in frames:
                 try:
+                    if verbose:
+                        print(f"→ Searching for Grant button in frame: {fr.url}")
                     loc = fr.get_by_role("button", name=grant_labels).first
                     if await loc.is_visible():
                         if verbose:
-                            print(f"→ Clicking consent button in frame {fr.url}")
+                            print(f"→ Found visible consent button in frame {fr.url}, clicking...")
                         await loc.click(timeout=6000)
+                        if verbose:
+                            print(f"→ Waiting for network idle after grant click...")
                         await fr.wait_for_load_state("networkidle")
+                        if verbose:
+                            print(f"✓ Consent grant successful in frame {fr.url}")
                         return True
-                except Exception:
+                    else:
+                        if verbose:
+                            print(f"→ Grant button found but not visible in frame {fr.url}")
+                except Exception as e:
+                    if verbose:
+                        print(f"→ Grant button search failed in frame {fr.url}: {e}")
                     pass
                 try:
                     loc = fr.get_by_role("link", name=grant_labels).first
                     if await loc.is_visible():
                         if verbose:
-                            print(f"→ Clicking consent link in frame {fr.url}")
+                            print(f"→ Found visible consent link in frame {fr.url}, clicking...")
                         await loc.click(timeout=6000)
                         await fr.wait_for_load_state("networkidle")
+                        if verbose:
+                            print(f"✓ Consent grant link successful in frame {fr.url}")
                         return True
-                except Exception:
+                except Exception as e:
+                    if verbose:
+                        print(f"→ Grant link search failed in frame {fr.url}: {e}")
                     pass
                 # Try generic selectors
                 for sel in [
@@ -409,10 +463,16 @@ async def handle_otp_and_consent(page, totp_secret: str, base_host: str, verbose
 
         # Try to click grant for up to ~8 seconds
         end_grant = page.context._impl_obj._loop.time() + 8
+        grant_clicked = False
         while page.context._impl_obj._loop.time() < end_grant:
             if await try_click_grant_anywhere():
+                grant_clicked = True
+                if verbose:
+                    print(f"✓ Consent grant button clicked successfully")
                 return
             await page.wait_for_timeout(250)
+        if not grant_clicked and verbose:
+            print(f"⚠️ Grant button not found/clicked, checking for redirect...")
 
         # Or success by redirect back to hub
         end = page.context._impl_obj._loop.time() + 10
@@ -490,8 +550,39 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
 
         test_cases = sanitize_tests(test_cases)
 
+        # Log repair status at startup
+        if verbose and repair:
+            print(f"🔧 Repair mode ENABLED (model={model_id}, region={region})")
+        elif verbose and not repair:
+            print(f"⚠️  Repair mode DISABLED (use --repair to enable)")
+
         results = []
         session_logged_in = False
+        
+        # Helper function to generate descriptive screenshot names
+        def sanitize_for_filename(text: str) -> str:
+            """Sanitize text for use in filenames."""
+            import re
+            # Replace spaces and special chars with underscores
+            text = re.sub(r'[^\w\s-]', '', text)
+            text = re.sub(r'[-\s]+', '_', text)
+            return text.strip('_').lower()[:100]  # Limit length
+        
+        def get_screenshot_path(test_name: str, step_index: int, action_type: str, context: str = "", extension: str = "png") -> Path:
+            """Generate a descriptive screenshot path.
+            
+            Args:
+                test_name: Name of the test case
+                step_index: Step number (1-based)
+                action_type: Type of screenshot (screenshot, verify, repair, failure, success)
+                context: Additional context (e.g., "after-login", "manage-studies-page")
+                extension: File extension (png or jpg)
+            """
+            test_slug = sanitize_for_filename(test_name)
+            action_slug = sanitize_for_filename(action_type)
+            context_slug = f"_{sanitize_for_filename(context)}" if context else ""
+            filename = f"test_{test_slug}_step{step_index:02d}_{action_slug}{context_slug}.{extension}"
+            return screenshots_dir / filename
 
         # Simple selector cache (persists across runs)
         cache_path = Path("data/selector_cache.json")
@@ -664,12 +755,13 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                 if m:
                     selector = f"text={m.group(1)}"
 
-            # Normalize dict with {type,value}
+            # Normalize dict with {type,value} - but preserve original for verification
+            original_selector_for_verification = selector.copy() if isinstance(selector, dict) else None
             if isinstance(selector, dict) and "type" in selector and "value" in selector and "text" not in selector and "css" not in selector and "data-testid" not in selector:
                 t = (selector.get("type") or "").lower()
                 v = selector.get("value")
                 if t == "text":
-                    selector = {"text": v}
+                    selector = {"text": v, "_original_type": "text", "_original_value": v}  # Preserve for verification
                 elif t in ("css",):
                     selector = {"css": v}
                 elif t in ("testid", "data-testid"): 
@@ -688,11 +780,29 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                     if fr:
                         cache_put(cache_key, {"engine": "testid", "value": selector["data-testid"]})
                         return fr, loc, cache_key
-                if "role" in selector and "name" in selector:
-                    fr, loc = await find_locator_any_frame({"engine": "role", "role": selector["role"], "name_regex": re.escape(selector["name"])})
-                    if fr:
-                        cache_put(cache_key, {"engine": "role", "role": selector["role"], "name_regex": re.escape(selector["name"])})
-                        return fr, loc, cache_key
+                # Handle role with name, value, or text
+                if "role" in selector:
+                    name_val = None
+                    if "name" in selector:
+                        name_val = selector["name"]
+                    elif "value" in selector:
+                        # Normalize "value" to "name" for role-based selectors
+                        name_val = selector["value"]
+                    elif "text" in selector:
+                        name_val = selector["text"]
+                    
+                    if name_val:
+                        if verbose:
+                            print(f"🔍 resolve_target: Trying role='{selector['role']}', name='{name_val}'")
+                        fr, loc = await find_locator_any_frame({"engine": "role", "role": selector["role"], "name_regex": re.escape(name_val)})
+                        if fr:
+                            if verbose:
+                                print(f"🔍 resolve_target: Found frame for role='{selector['role']}', name='{name_val}'")
+                            cache_put(cache_key, {"engine": "role", "role": selector["role"], "name_regex": re.escape(name_val)})
+                            return fr, loc, cache_key
+                        else:
+                            if verbose:
+                                print(f"🔍 resolve_target: No frame found for role='{selector['role']}', name='{name_val}'")
                 if "text" in selector:
                     fr, loc = await find_locator_any_frame({"engine": "text", "text": selector["text"]})
                     if fr:
@@ -702,6 +812,12 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                     fr, loc = await find_locator_any_frame({"engine": "css", "value": selector["css"]})
                     if fr:
                         cache_put(cache_key, {"engine": "css", "value": selector["css"]})
+                        return fr, loc, cache_key
+                # Handle "value" as standalone text selector if no other keys match
+                if "value" in selector and "role" not in selector and "type" not in selector:
+                    fr, loc = await find_locator_any_frame({"engine": "text", "text": selector["value"]})
+                    if fr:
+                        cache_put(cache_key, {"engine": "text", "text": selector["value"]})
                         return fr, loc, cache_key
 
             # 1) Native Playwright test id engine "data-testid=" style
@@ -791,45 +907,344 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
 
             return None, None, cache_key
 
-        async def agent_repair(selector: str, context_hint: str = "") -> list[str]:
+        def selector_to_repair_string(selector) -> str:
+            """Convert a selector (dict or string) to a meaningful string for repair."""
+            if isinstance(selector, dict):
+                # Convert dict to a readable format
+                parts = []
+                if "data-testid" in selector:
+                    parts.append(f"data-testid='{selector['data-testid']}'")
+                if "type" in selector and "value" in selector:
+                    if selector["type"] == "data-testid":
+                        parts.append(f"data-testid='{selector['value']}'")
+                    elif selector["type"] == "text":
+                        parts.append(f"text='{selector['value']}'")
+                    else:
+                        parts.append(f"{selector['type']}='{selector['value']}'")
+                if "role" in selector:
+                    role_part = f"role='{selector['role']}'"
+                    if "name" in selector:
+                        role_part += f" name='{selector['name']}'"
+                    elif "value" in selector:
+                        # Normalize "value" to "name" for role-based selectors
+                        role_part += f" name='{selector['value']}'"
+                    elif "text" in selector:
+                        role_part += f" text='{selector['text']}'"
+                    parts.append(role_part)
+                if "text" in selector and "role" not in selector:
+                    parts.append(f"text='{selector['text']}'")
+                if "css" in selector:
+                    parts.append(f"css='{selector['css']}'")
+                # Handle standalone "value" key (not part of type/role)
+                if "value" in selector and "type" not in selector and "role" not in selector:
+                    parts.append(f"text='{selector['value']}'")
+                return " ".join(parts) if parts else json.dumps(selector)
+            return str(selector)
+
+        async def agent_repair(selector, context_hint: str = "", test_name: str = "unknown", step_index: int = 0) -> list[str]:
             """Ask the agent for alternative selectors. Returns a list of suggested selectors."""
             if not repair or not model_id or not region:
                 return []
             try:
-                # Minimal, safe prompt: propose only CSS or test id forms
-                from story_agent import bedrock_invoke_claude
-                prompt = (
-                    "You are a test selector repair assistant. Given a failed selector and a short page URL, propose up to 3 alternative selectors.\n"
-                    "Rules: Only output a JSON array of strings; each must be a CSS selector or data-testid form. No prose.\n\n"
-                    f"Failed selector: {selector}\n"
-                    f"Current URL: {context_hint}\n"
-                )
-                if verbose:
-                    print(f"🔧 Repairing selector: {selector}")
-                raw = bedrock_invoke_claude(prompt, model_id=model_id, region=region, verbose=verbose)
+                # Convert selector to string for repair prompt
+                selector_str = selector_to_repair_string(selector)
+                
+                # Get element inventory for context
                 try:
-                    arr = json.loads(raw.strip().split("```")[-1]) if raw.strip().startswith("```") else json.loads(raw)
+                    inventory = await build_element_inventory(page, limit=100)
+                except Exception:
+                    inventory = {}
+                
+                # Get DOM snapshot for better context
+                dom_snapshot = ""
+                try:
+                    # Get a simplified DOM structure (focusing on attributes useful for selectors)
+                    dom_snapshot = await page.evaluate("""
+                        () => {
+                            function extractSelectorInfo(el, depth = 0) {
+                                if (depth > 5) return null; // Limit depth
+                                const info = {
+                                    tag: el.tagName?.toLowerCase(),
+                                    id: el.id || null,
+                                    testid: el.getAttribute('data-testid') || null,
+                                    class: el.className?.baseVal || el.className || null,
+                                    role: el.getAttribute('role') || null,
+                                    'aria-label': el.getAttribute('aria-label') || null,
+                                    text: (el.innerText || el.textContent || '').trim().substring(0, 50) || null,
+                                    children: []
+                                };
+                                
+                                // Limit children to first 10
+                                Array.from(el.children || []).slice(0, 10).forEach(child => {
+                                    const childInfo = extractSelectorInfo(child, depth + 1);
+                                    if (childInfo) info.children.push(childInfo);
+                                });
+                                
+                                return info;
+                            }
+                            
+                            return JSON.stringify(extractSelectorInfo(document.body), null, 2);
+                        }
+                    """)
+                except Exception as e:
+                    if verbose:
+                        print(f"⚠️ Could not extract DOM snapshot: {e}")
+                    dom_snapshot = "DOM extraction failed"
+                
+                # Capture screenshot for visual context
+                import base64
+                shot_bytes = None
+                try:
+                    shot_bytes = await page.screenshot(full_page=True, type="jpeg", quality=70)
+                    img_payload = [{"media_type": "image/jpeg", "data_base64": base64.b64encode(shot_bytes).decode("ascii")}]
+                    # Save repair screenshot for debugging (if we have context)
+                    # Note: This will be saved later when we have test/step context
+                except Exception as e:
+                    if verbose:
+                        print(f"⚠️ Could not capture screenshot: {e}")
+                    img_payload = []
+                
+                # Enhanced prompt with visual and DOM context
+                from story_agent import bedrock_invoke_claude, bedrock_invoke_claude_multimodal
+                
+                prompt = (
+                    "You are a test selector repair assistant. Given a failed selector, a page screenshot, DOM structure, and available elements, propose up to 3 alternative selectors.\n"
+                    "Rules: Only output a JSON array of strings; each must be a CSS selector, data-testid form, text selector, or role-based selector. No prose.\n"
+                    "Prefer stable selectors: data-testid > role+name > id > aria-label > class. Avoid fragile CSS selectors.\n\n"
+                    f"Failed selector: {selector_str}\n"
+                    f"Current URL: {context_hint}\n"
+                    f"Available testids: {json.dumps(inventory.get('testids', []), indent=2)}\n"
+                    f"Available buttons (by text): {json.dumps(inventory.get('buttons', []), indent=2)}\n"
+                    f"Available menuitems (by text): {json.dumps(inventory.get('menuitems', []), indent=2)}\n"
+                    f"DOM structure (simplified, first 2000 chars):\n{dom_snapshot[:2000]}\n"
+                )
+                
+                if verbose:
+                    print(f"🔧 Repairing selector: {selector_str}")
+                    if img_payload:
+                        print(f"🔧 Using screenshot + DOM for context")
+                    else:
+                        print(f"🔧 Using DOM only (screenshot unavailable)")
+                
+                # Use multimodal if screenshot available, otherwise text-only
+                if img_payload:
+                    raw = bedrock_invoke_claude_multimodal(prompt, images=img_payload, model_id=model_id, region=region, verbose=verbose)
+                    # Save repair screenshot for debugging
+                    if shot_bytes:
+                        try:
+                            selector_slug = sanitize_for_filename(selector_str[:50])
+                            repair_path = get_screenshot_path(test_name, step_index, "repair", context=selector_slug, extension="jpg")
+                            repair_path.write_bytes(shot_bytes)
+                            if verbose:
+                                print(f"📸 Repair screenshot saved: {repair_path.name}")
+                        except Exception as e:
+                            if verbose:
+                                print(f"⚠️ Could not save repair screenshot: {e}")
+                else:
+                    raw = bedrock_invoke_claude(prompt, model_id=model_id, region=region, verbose=verbose)
+                try:
+                    # Clean up JSON extraction
+                    body = raw.strip()
+                    if "```json" in body:
+                        body = body.split("```json")[1].split("```")[0].strip()
+                    elif "```" in body:
+                        body = body.split("```")[1].split("```")[0].strip()
+                    arr = json.loads(body)
                     if isinstance(arr, list):
                         if verbose:
                             print(f"🔧 Repair suggestions: {arr}")
                         return [s for s in arr if isinstance(s, str) and s]
-                except Exception:
+                except Exception as e:
                     if verbose:
-                        print("🔧 Repair returned non-JSON or unusable content")
+                        print(f"🔧 Repair returned non-JSON or unusable content: {e}")
                     return []
-            except Exception:
+            except Exception as e:
+                if verbose:
+                    print(f"🔧 Repair error: {e}")
                 return []
 
-        async def resolve_with_repair(selector: str, hints: dict | None = None):
+        async def resolve_with_repair(selector, hints: dict | None = None, verify_exists: bool = False, test_name: str = "unknown", step_index: int = 0):
+            """Resolve selector with repair support.
+            
+            Args:
+                selector: The selector to resolve
+                hints: Optional hints for resolution
+                verify_exists: If True, verify element actually exists (count > 0) before considering it resolved
+            """
+            if verbose:
+                print(f"🔍 resolve_with_repair called: selector={selector}, verify_exists={verify_exists}, repair={repair}")
+            
             fr, loc, key = await resolve_target(selector, hints)
+            if verbose:
+                print(f"🔍 resolve_target returned: fr={fr is not None}, key={key}")
+            
             if fr:
-                return fr, loc, key
-            # Agent repair attempt once
-            suggestions = await agent_repair(selector, context_hint=page.url)
-            for sug in suggestions[:3]:
-                fr, loc, key2 = await resolve_target(sug, hints)
+                # If verify_exists is True, check that the element actually exists AND matches
+                if verify_exists:
+                    try:
+                        cnt = await loc.count()
+                        if verbose:
+                            print(f"🔍 Element count check: cnt={cnt}")
+                        if not cnt or cnt <= 0:
+                            if verbose:
+                                print(f"🔧 Selector resolved but element count is 0, treating as not found: {selector}")
+                            fr = None  # Treat as not found
+                        else:
+                            # Verify the element actually matches what we're looking for
+                            if isinstance(selector, dict):
+                                # For role-based selectors, verify the accessible name matches
+                                if "role" in selector:
+                                    expected_name = selector.get("name") or selector.get("value") or selector.get("text")
+                                    if expected_name:
+                                        try:
+                                            # Use Playwright's accessible name (most reliable)
+                                            actual_name = await loc.evaluate("""
+                                                el => {
+                                                    // Try aria-label first
+                                                    if (el.getAttribute('aria-label')) {
+                                                        return el.getAttribute('aria-label').trim();
+                                                    }
+                                                    // Then try innerText
+                                                    if (el.innerText) {
+                                                        return el.innerText.trim();
+                                                    }
+                                                    // Then textContent
+                                                    if (el.textContent) {
+                                                        return el.textContent.trim();
+                                                    }
+                                                    return '';
+                                                }
+                                            """)
+                                            actual_name = actual_name or ""
+                                            
+                                            # Check if names match (case-insensitive, allow partial/substring match)
+                                            # But reject empty actual_name unless expected is also empty
+                                            expected_lower = expected_name.lower().strip()
+                                            actual_lower = actual_name.lower().strip()
+                                            
+                                            # Reject if actual name is empty but we expected something
+                                            if not actual_lower and expected_lower:
+                                                if verbose:
+                                                    print(f"🔧 Element found but name is empty (expected '{expected_name}'), treating as not found")
+                                                fr = None  # Treat as not found - will trigger repair
+                                            elif expected_lower not in actual_lower and actual_lower not in expected_lower:
+                                                if verbose:
+                                                    print(f"🔧 Element found but name mismatch: expected '{expected_name}', got '{actual_name}', treating as not found")
+                                                fr = None  # Treat as not found - will trigger repair
+                                            else:
+                                                if verbose:
+                                                    print(f"✓ Element found with matching name: '{actual_name}' (expected '{expected_name}')")
+                                        except Exception as e:
+                                            if verbose:
+                                                print(f"⚠️ Could not verify element name, assuming match: {e}")
+                                # For text-based selectors, verify the text content matches
+                                # Check both original form and normalized form
+                                elif selector.get("type") == "text" or "text" in selector or selector.get("_original_type") == "text":
+                                    expected_text = selector.get("value") or selector.get("text") or selector.get("_original_value")
+                                    if expected_text:
+                                        try:
+                                            # Get text content of the element
+                                            actual_text = await loc.evaluate("""
+                                                el => {
+                                                    // Try innerText first (more accurate)
+                                                    if (el.innerText) {
+                                                        return el.innerText.trim();
+                                                    }
+                                                    // Then textContent
+                                                    if (el.textContent) {
+                                                        return el.textContent.trim();
+                                                    }
+                                                    // Then aria-label
+                                                    if (el.getAttribute('aria-label')) {
+                                                        return el.getAttribute('aria-label').trim();
+                                                    }
+                                                    return '';
+                                                }
+                                            """)
+                                            actual_text = actual_text or ""
+                                            
+                                            expected_lower = expected_text.lower().strip()
+                                            actual_lower = actual_text.lower().strip()
+                                            
+                                            # Reject if actual text is empty but we expected something
+                                            if not actual_lower and expected_lower:
+                                                if verbose:
+                                                    print(f"🔧 Element found but text is empty (expected '{expected_text}'), treating as not found")
+                                                fr = None  # Treat as not found - will trigger repair
+                                            elif expected_lower not in actual_lower and actual_lower not in expected_lower:
+                                                if verbose:
+                                                    print(f"🔧 Element found but text mismatch: expected '{expected_text}', got '{actual_text}', treating as not found")
+                                                fr = None  # Treat as not found - will trigger repair
+                                            else:
+                                                if verbose:
+                                                    print(f"✓ Element found with matching text: '{actual_text}' (expected '{expected_text}')")
+                                        except Exception as e:
+                                            if verbose:
+                                                print(f"⚠️ Could not verify element text, assuming match: {e}")
+                                else:
+                                    if verbose:
+                                        print(f"✓ Element found with count {cnt} (no text/name verification needed)")
+                            else:
+                                if verbose:
+                                    print(f"✓ Element found with count {cnt}")
+                    except Exception as e:
+                        if verbose:
+                            print(f"🔧 Error checking element count: {e}, treating as not found")
+                        fr = None
+                else:
+                    if verbose:
+                        print(f"⚠️ verify_exists=False, skipping count check")
                 if fr:
-                    return fr, loc, key2
+                    if verbose:
+                        print(f"✓ Returning resolved element (fr is set)")
+                    return fr, loc, key
+                else:
+                    if verbose:
+                        print(f"✖ fr was cleared by verify_exists check, will attempt repair")
+            else:
+                if verbose:
+                    print(f"✖ resolve_target returned None, will attempt repair")
+            
+            # Agent repair attempt once - only if repair is enabled
+            if repair and model_id and region:
+                if verbose:
+                    print(f"🔧 Selector not found, attempting repair: {selector}")
+                suggestions = await agent_repair(selector, context_hint=page.url, test_name=test_name, step_index=step_index)
+                if not suggestions:
+                    if verbose:
+                        print(f"🔧 No repair suggestions returned from agent")
+                else:
+                    if verbose:
+                        print(f"🔧 Got {len(suggestions)} repair suggestions")
+                for i, sug in enumerate(suggestions[:3], 1):
+                    if verbose:
+                        print(f"🔧 Trying repair suggestion {i}/{len(suggestions[:3])}: {sug}")
+                    fr2, loc2, key2 = await resolve_target(sug, hints)
+                    if fr2:
+                        # Verify the repaired selector actually works
+                        try:
+                            cnt = await loc2.count()
+                            if cnt and cnt > 0:
+                                if verbose:
+                                    print(f"✓ Repair successful with: {sug} (count={cnt})")
+                                return fr2, loc2, key2
+                            else:
+                                if verbose:
+                                    print(f"✖ Repair suggestion returned element with count 0: {sug}")
+                        except Exception as e:
+                            if verbose:
+                                print(f"✖ Repair suggestion error: {e}")
+                    else:
+                        if verbose:
+                            print(f"✖ Repair suggestion could not resolve: {sug}")
+                if verbose:
+                    print(f"✖ Repair did not find working alternative")
+            else:
+                if verbose:
+                    repair_status = f"repair={repair}, model_id={model_id}, region={region}"
+                    print(f"⚠️ Repair not enabled: {repair_status}")
+            if verbose:
+                print(f"✖ Returning None from resolve_with_repair")
             return None, None, key
 
         async def agent_verify_state_if_enabled(step: dict, test_name: str, step_index: int) -> str:
@@ -881,13 +1296,16 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                 verdict = {"ok": True, "reason": "Agent returned non-JSON; skipping enforcement"}
             if verbose:
                 print(f"🤖 Verify verdict: {verdict}")
-            # Always persist verification screenshot
+            # Always persist verification screenshot with descriptive name
             try:
-                slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", test_name).strip("_").lower() or "test"
-                verify_path = screenshots_dir / f"verify_{slug}_step{step_index}.jpg"
+                verify_path = get_screenshot_path(test_name, step_index, "verify", context="agent_check", extension="jpg")
                 verify_path.write_bytes(shot_bytes)
                 saved_path = str(verify_path)
-            except Exception:
+                if verbose:
+                    print(f"📸 Verification screenshot saved: {verify_path.name}")
+            except Exception as e:
+                if verbose:
+                    print(f"⚠️ Could not save verification screenshot: {e}")
                 saved_path = ""
             if isinstance(verdict, dict) and verdict.get("ok") is False:
                 # Fail the step based on agent's truth
@@ -987,13 +1405,25 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                         _ver_path = await agent_verify_state_if_enabled(step, test.get('name','Unnamed'), idx)
                     elif action in ("assert_element_present", "assert_element_presence", "assert_element_exists", "assert_element_visible", "assert_element", "assert"):
                         selector = step.get("selector") or step.get("target")
-                        fr, loc, key = await resolve_with_repair(selector, hints=None)
+                        if verbose:
+                            print(f"🔍 Assert action: resolving selector {selector}")
+                        # For assert actions, verify element exists (count > 0) during resolution
+                        fr, loc, key = await resolve_with_repair(selector, hints=None, verify_exists=True, test_name=test.get("name", "unknown"), step_index=idx)
                         if not fr:
+                            if verbose:
+                                print(f"🔍 First attempt failed, trying to open user menu and retry")
                             # Try opening user menu then retry
                             await open_user_menu_if_needed()
-                            fr, loc, key = await resolve_with_repair(selector, hints=None)
+                            fr, loc, key = await resolve_with_repair(selector, hints=None, verify_exists=True, test_name=test.get("name", "unknown"), step_index=idx)
                         if not fr:
-                            raise AssertionError(f"Could not resolve selector: {selector}")
+                            error_msg = f"Could not resolve selector: {selector}"
+                            if repair and model_id and region:
+                                error_msg += " (repair was attempted but found no working alternatives)"
+                            if verbose:
+                                print(f"✖ {error_msg}")
+                            raise AssertionError(error_msg)
+                        if verbose:
+                            print(f"✓ Assert selector resolved successfully")
                         # Presence vs visibility semantics
                         expect_exists = step.get("exists") if "exists" in step else step.get("existence") if "existence" in step else None
                         if expect_exists is False:
@@ -1009,24 +1439,47 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                             # Only require presence (not visibility)
                             cnt = await loc.count()
                             if not cnt or cnt <= 0:
-                                raise AssertionError(f"Element not found: {selector}")
+                                # Element was resolved but count is 0 - try repair one more time
+                                if repair and model_id and region and verbose:
+                                    print(f"🔧 Element resolved but count is 0, attempting repair: {selector}")
+                                if repair and model_id and region:
+                                    await open_user_menu_if_needed()
+                                    fr2, loc2, key2 = await resolve_with_repair(selector, hints=None, test_name=test.get("name", "unknown"), step_index=idx)
+                                    if fr2:
+                                        cnt2 = await loc2.count()
+                                        if cnt2 and cnt2 > 0:
+                                            loc = loc2
+                                            fr = fr2
+                                            key = key2
+                                            cnt = cnt2
+                                if not cnt or cnt <= 0:
+                                    error_msg = f"Element not found: {selector}"
+                                    if repair and model_id and region:
+                                        error_msg += " (repair was attempted but found no working alternatives)"
+                                    raise AssertionError(error_msg)
                         else:
                             # Default behavior: require visibility
                             try:
                                 await loc.wait_for(state="visible", timeout=8000)
                             except Exception:
                                 # Trigger repair on visibility timeout as well
-                                fr, loc, key = await resolve_with_repair(selector, hints=None)
+                                fr, loc, key = await resolve_with_repair(selector, hints=None, verify_exists=True, test_name=test.get("name", "unknown"), step_index=idx)
+                                if not fr:
+                                    raise AssertionError(f"Element not visible after repair attempt: {selector}")
                                 await loc.wait_for(state="visible", timeout=5000)
                         _ver_path = await agent_verify_state_if_enabled(step, test.get('name','Unnamed'), idx)
                     elif action == "click":
                         selector = step.get("selector") or step.get("target")
-                        fr, loc, key = await resolve_with_repair(selector, hints=None)
+                        # For click actions, verify element exists (count > 0) during resolution
+                        fr, loc, key = await resolve_with_repair(selector, hints=None, verify_exists=True, test_name=test.get("name", "unknown"), step_index=idx)
                         if not fr:
                             await open_user_menu_if_needed()
-                            fr, loc, key = await resolve_with_repair(selector, hints=None)
+                            fr, loc, key = await resolve_with_repair(selector, hints=None, verify_exists=True, test_name=test.get("name", "unknown"), step_index=idx)
                         if not fr:
-                            raise AssertionError(f"Could not resolve selector for click: {selector}")
+                            error_msg = f"Could not resolve selector for click: {selector}"
+                            if repair and model_id and region:
+                                error_msg += " (repair was attempted but found no working alternatives)"
+                            raise AssertionError(error_msg)
                         # If it is a link, ensure allowlisted
                         try:
                             href = await loc.get_attribute("href")
@@ -1057,8 +1510,26 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                         if expected and expected not in cur:
                             raise AssertionError(f"URL '{cur}' does not contain '{expected}'")
                     elif action in ("screenshot",):
-                        name = step.get("name", test.get("name", "screenshot").replace(" ", "_").lower())
-                        shot = screenshots_dir / f"{name}.png"
+                        # Use custom name from step if provided, otherwise generate descriptive name
+                        custom_name = step.get("name", "")
+                        if custom_name:
+                            context = sanitize_for_filename(custom_name)
+                        else:
+                            # Generate context from step action/target
+                            context_parts = []
+                            if step.get("action"):
+                                context_parts.append(step.get("action"))
+                            if step.get("target") or step.get("selector"):
+                                target = step.get("target") or step.get("selector")
+                                if isinstance(target, dict):
+                                    if target.get("data-testid"):
+                                        context_parts.append(target.get("data-testid"))
+                                    elif target.get("text") or target.get("value"):
+                                        context_parts.append(target.get("text") or target.get("value"))
+                                    elif target.get("role"):
+                                        context_parts.append(target.get("role"))
+                            context = "_".join([sanitize_for_filename(str(p)) for p in context_parts if p]) or "screenshot"
+                        shot = get_screenshot_path(test.get("name", "unknown"), idx, "screenshot", context=context, extension="png")
                         # Optional delay before screenshot to allow UI to settle
                         try:
                             delay_ms = int(os.environ.get("SCREENSHOT_DELAY_MS", "2000"))
@@ -1068,6 +1539,8 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                             await page.wait_for_timeout(delay_ms)
                         await page.screenshot(path=str(shot), full_page=True)
                         screenshot = str(shot)
+                        if verbose:
+                            print(f"📸 Screenshot saved: {shot.name}")
                     else:
                         # Unknown action
                         raise AssertionError(f"Unknown action in rewritten runner: {action}")
@@ -1082,7 +1555,9 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                     current_url = ""
                 print(f"✖ Test failed: {test.get('name','Unnamed')} — {error} (url={current_url})")
                 try:
-                    shot = screenshots_dir / (test.get("name", "failure").replace(" ", "_").lower() + "_failure.png")
+                    # Generate descriptive failure screenshot name with step info
+                    error_context = sanitize_for_filename(error.split("(")[0].strip()[:50]) if error else "error"
+                    shot = get_screenshot_path(test.get("name", "unknown"), idx, "failure", context=error_context, extension="png")
                     # Apply same pre-screenshot delay on failure captures
                     try:
                         delay_ms = int(os.environ.get("SCREENSHOT_DELAY_MS", "2000"))
@@ -1092,7 +1567,11 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                         await page.wait_for_timeout(delay_ms)
                     await page.screenshot(path=str(shot), full_page=True)
                     screenshot = str(shot)
-                except Exception:
+                    if verbose:
+                        print(f"📸 Failure screenshot saved: {shot.name}")
+                except Exception as e:
+                    if verbose:
+                        print(f"⚠️ Could not save failure screenshot: {e}")
                     pass
 
             results.append({
