@@ -929,11 +929,32 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                                 if verbose:
                                     print("→ No Login button; treating as logged in")
                             else:
-                                username = os.environ.get(step.get("username_env", "LOGIN_USERNAME"), "")
-                                password = os.environ.get(step.get("password_env", "LOGIN_PASSWORD"), "")
-                                secret = os.environ.get(step.get("totp_env", "TOTP_SECRET"), "")
-                                if not username or not password or not secret:
-                                    raise AssertionError("Missing LOGIN_USERNAME/LOGIN_PASSWORD/TOTP_SECRET envs")
+                                username_env = step.get("username_env", "LOGIN_USERNAME")
+                                password_env = step.get("password_env", "LOGIN_PASSWORD")
+                                totp_env = step.get("totp_env", "TOTP_SECRET")
+                                
+                                username = os.environ.get(username_env, "")
+                                password = os.environ.get(password_env, "")
+                                secret = os.environ.get(totp_env, "")
+                                
+                                # Debug: show which env vars are checked
+                                if verbose:
+                                    print(f"→ Checking env vars: {username_env}={bool(username)}, {password_env}={bool(password)}, {totp_env}={bool(secret)}")
+                                
+                                # Provide detailed error message about which variables are missing
+                                missing = []
+                                if not username:
+                                    missing.append(username_env)
+                                if not password:
+                                    missing.append(password_env)
+                                if not secret:
+                                    missing.append(totp_env)
+                                
+                                if missing:
+                                    error_msg = f"Missing required environment variables: {', '.join(missing)}. Please set these before running tests."
+                                    if verbose:
+                                        print(f"✖ {error_msg}")
+                                    raise AssertionError(error_msg)
                                 await click_login_button(page, verbose=verbose)
                                 await click_login_gov(page, verbose=verbose)
                                 await fill_credentials_and_submit(page, username, password, verbose=verbose)
