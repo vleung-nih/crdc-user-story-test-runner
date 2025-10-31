@@ -426,7 +426,7 @@ async def handle_otp_and_consent(page, totp_secret: str, base_host: str, verbose
     raise AssertionError("OTP failed after 2 attempts")
 
 
-async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, headless: bool = True, verbose: bool = False, model_id: str | None = None, region: str | None = None, repair: bool = False, agent_verify: bool = False) -> dict:
+async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, headless: bool = True, verbose: bool = False, model_id: str | None = None, region: str | None = None, repair: bool = False, agent_verify: bool = False, allow_direct_nav: bool = False) -> dict:
     screenshots_dir = run_dir / "screenshots"
     screenshots_dir.mkdir(parents=True, exist_ok=True)
 
@@ -464,6 +464,31 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                 await popup_page.close()
 
         page.on("popup", lambda p: asyncio.create_task(on_popup(p)))
+
+        # Sanitize deep-link navigations if not allowed
+        def sanitize_tests(cases: list[dict]) -> list[dict]:
+            if allow_direct_nav:
+                return cases
+            sanitized: list[dict] = []
+            for t in cases:
+                steps = []
+                for s in t.get("steps", []):
+                    act = s.get("action")
+                    if act in ("navigate", "navigate_to"):
+                        u = s.get("url") or s.get("target") or "/"
+                        try:
+                            parsed = urllib.parse.urlparse(u if u.startswith("http") else (base_url.rstrip("/") + "/" + u.lstrip("/")))
+                            if parsed.path not in ("", "/"):
+                                if verbose:
+                                    print(f"↷ Removing deep-link navigate step (policy): {u}")
+                                continue
+                        except Exception:
+                            pass
+                    steps.append(s)
+                sanitized.append({**t, "steps": steps})
+            return sanitized
+
+        test_cases = sanitize_tests(test_cases)
 
         results = []
         session_logged_in = False
@@ -810,61 +835,64 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
         async def agent_verify_state_if_enabled(step: dict, test_name: str, step_index: int) -> str:
             if not agent_verify or not model_id or not region:
                 return ""
+            # Lightweight DOM snapshot
             try:
-                # Lightweight DOM snapshot
                 inventory = await build_element_inventory(page, limit=100)
-                from story_agent import bedrock_invoke_claude, bedrock_invoke_claude_multimodal
-                if verbose:
-                    print(f"→ Verifying step via agent (url={page.url})")
-                    try:
-                        print(f"→ Verify step summary: action={step.get('action')} target={step.get('target') or step.get('selector')}")
-                    except Exception:
-                        pass
-                prompt = (
-                    "You are verifying a UI test step result. Output only JSON: {\"ok\": boolean, \"reason\": string}.\n"
-                    "Given the current URL, the expected step, a page screenshot, and a summary of present elements, decide if the step truly succeeded.\n"
-                    f"Current URL: {page.url}\n"
-                    f"Step: {json.dumps(step)}\n"
-                    f"Elements: {json.dumps(inventory)}\n"
-                )
-                # Capture an on-the-fly JPEG screenshot for verification
-                import base64
-                shot_bytes = await page.screenshot(full_page=True, type="jpeg", quality=70)
-                img_payload = [{"media_type": "image/jpeg", "data_base64": base64.b64encode(shot_bytes).decode("ascii")}]
+            except Exception:
+                inventory = {"error": "inventory_failed"}
+            from story_agent import bedrock_invoke_claude_multimodal
+            if verbose:
+                print(f"→ Verifying step via agent (url={page.url})")
+                try:
+                    print(f"→ Verify step summary: action={step.get('action')} target={step.get('target') or step.get('selector')}")
+                except Exception:
+                    pass
+            prompt = (
+                "You are verifying a UI test step result. Output only JSON: {\"ok\": boolean, \"reason\": string}.\n"
+                "Given the current URL, the expected step, a page screenshot, and a summary of present elements, decide if the step truly succeeded.\n"
+                f"Current URL: {page.url}\n"
+                f"Step: {json.dumps(step)}\n"
+                f"Elements: {json.dumps(inventory)}\n"
+            )
+            # Capture an on-the-fly JPEG screenshot for verification
+            import base64
+            shot_bytes = await page.screenshot(full_page=True, type="jpeg", quality=70)
+            img_payload = [{"media_type": "image/jpeg", "data_base64": base64.b64encode(shot_bytes).decode("ascii")}]
+            try:
                 raw = bedrock_invoke_claude_multimodal(prompt, images=img_payload, model_id=model_id, region=region, verbose=verbose)
-                verdict = {}
-                try:
-                    body = raw.strip()
-                    # Strip code fences if present
-                    if body.startswith("```"):
-                        body = body.replace("```json", "").replace("```", "").strip()
-                    # Fallback: extract between first { and last }
-                    if not body.strip().startswith("{"):
-                        start = body.find("{")
-                        end = body.rfind("}")
-                        if start != -1 and end != -1 and end > start:
-                            body = body[start:end+1]
-                    verdict = json.loads(body)
-                except Exception:
-                    verdict = {"ok": True, "reason": "Agent returned non-JSON; skipping enforcement"}
-                if verbose:
-                    print(f"🤖 Verify verdict: {verdict}")
-                if isinstance(verdict, dict) and verdict.get("ok") is False:
-                    raise AssertionError(f"Agent verification failed: {verdict.get('reason','no reason')}")
-                # Save verification screenshot to disk
-                try:
-                    # Normalize test name
-                    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", test_name).strip("_").lower() or "test"
-                    verify_path = screenshots_dir / f"verify_{slug}_step{step_index}.jpg"
-                    verify_path.write_bytes(shot_bytes)
-                    return str(verify_path)
-                except Exception:
-                    return ""
             except Exception as ve:
-                # If agent verification fails in parsing/transport, don't block unless explicit
                 if verbose:
-                    print(f"🤖 Verify error/non-blocking: {ve}")
-            return ""
+                    print(f"🤖 Verify error/non-blocking: transport error: {ve}")
+                return ""
+            verdict = {}
+            try:
+                body = raw.strip()
+                # Strip code fences if present
+                if body.startswith("```"):
+                    body = body.replace("```json", "").replace("```", "").strip()
+                # Fallback: extract between first { and last }
+                if not body.strip().startswith("{"):
+                    start = body.find("{")
+                    end = body.rfind("}")
+                    if start != -1 and end != -1 and end > start:
+                        body = body[start:end+1]
+                verdict = json.loads(body)
+            except Exception:
+                verdict = {"ok": True, "reason": "Agent returned non-JSON; skipping enforcement"}
+            if verbose:
+                print(f"🤖 Verify verdict: {verdict}")
+            # Always persist verification screenshot
+            try:
+                slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", test_name).strip("_").lower() or "test"
+                verify_path = screenshots_dir / f"verify_{slug}_step{step_index}.jpg"
+                verify_path.write_bytes(shot_bytes)
+                saved_path = str(verify_path)
+            except Exception:
+                saved_path = ""
+            if isinstance(verdict, dict) and verdict.get("ok") is False:
+                # Fail the step based on agent's truth
+                raise AssertionError(f"Agent verification failed: {verdict.get('reason','no reason')}")
+            return saved_path
 
         for test in test_cases:
             if verbose:
@@ -990,6 +1018,15 @@ async def run_test_suite(base_url: str, test_cases: list[dict], run_dir: Path, h
                     elif action in ("navigate_to", "navigate"):
                         url = step.get("url") or step.get("target") or "/"
                         target = url if url.startswith("http") else base_url.rstrip("/") + "/" + url.lstrip("/")
+                        # Guard direct navigation to deep paths unless explicitly allowed
+                        if not allow_direct_nav:
+                            # Permit base URL or "/" only; block if path beyond root and the step did not originate from a click
+                            try:
+                                parsed = urllib.parse.urlparse(target)
+                                if parsed.path not in ("", "/"):
+                                    raise AssertionError(f"Direct navigation blocked by policy: {target}. Use clicks to reach this page or run with --allow-direct-nav.")
+                            except Exception as nav_err:
+                                raise AssertionError(str(nav_err))
                         await page.goto(target, timeout=60000)
                         await page.wait_for_load_state("networkidle")
                         await consent_dismiss(page, verbose=verbose)

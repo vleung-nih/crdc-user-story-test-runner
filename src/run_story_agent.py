@@ -104,6 +104,7 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Print full prompts, responses, and step logs")
     parser.add_argument("--repair", action="store_true", help="Enable agent-in-the-loop selector repair on failures")
     parser.add_argument("--agent-verify", action="store_true", help="Ask agent to verify post-assert state to catch false positives")
+    parser.add_argument("--allow-direct-nav", action="store_true", help="Permit tests to navigate directly to deep URLs (disabled by default)")
 
     args = parser.parse_args()
 
@@ -144,6 +145,7 @@ def main():
             region=args.region,
             repair=args.repair,
             agent_verify=args.agent_verify,
+            allow_direct_nav=args.allow_direct_nav,
         ))
 
         results_path = run_dir / "results.json"
